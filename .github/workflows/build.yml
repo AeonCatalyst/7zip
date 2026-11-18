@@ -1,99 +1,201 @@
-name: "macOS Build"
+name: Build 7-Zip
 
 on:
+  push:
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - 'DOC/**'
   workflow_dispatch:
+    inputs:
+      doRelease:
+        description: 'Publish new GitHub release'
+        type: boolean
+        default: false
+        required: false
+      buildOnly:
+        description: 'Only build binaries (skip pre-checks)'
+        type: boolean
+        default: false
+        required: false
+  schedule:
+    # Randomize minute/hour in your fork to avoid concurrent spikes
+    - cron: '17 12 * * *'
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  DOTNET_CLI_TELEMETRY_OPTOUT: 1
-  DOTNET_NOLOGO: 1
-  BUNDLE_PATH: "CPP/7zip/Bundles/Alone2"
+permissions:
+  contents: write
 
 jobs:
-  macos-clang:
-    name: macOS Clang ${{ matrix.target }} (${{ matrix.asm_name }})
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
+  pre_check:
+    name: Pre Checks
+    if: ${{ github.event.inputs.buildOnly != 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Repo Check
+        if: ${{ github.event_name == 'schedule' }}
+        run: |
+          if [[ "$GITHUB_REPOSITORY" == "ip7z/7zip" ]]; then
+            echo "Scheduled builds are disabled on the upstream repository."
+            exit 1
+          fi
+
+  build_7zip:
+    name: Build (${{ matrix.target }})
+    if: ${{ (github.event.inputs.buildOnly == 'true' && !cancelled()) || success() }}
+    needs: pre_check
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: arm64
-            runner: macos-latest
-            makefile: cmpl_mac_arm64.mak
-            asm_name: Clang as
-            output_dir: m_arm64
-          - target: x64
-            runner: macos-latest
-            makefile: cmpl_mac_x64.mak
-            asm_name: Clang as
-            output_dir: m_x64
-
+          - target: linux-x64
+            os: ubuntu-latest
+            arch: x64
+            ext: tar.xz
+          - target: linux-arm64
+            os: ubuntu-latest
+            arch: arm64
+            ext: tar.xz
+          - target: win-x64
+            os: windows-latest
+            arch: x64
+            ext: zip
+          - target: win-arm64
+            os: windows-latest
+            arch: arm64
+            ext: zip
+          - target: macos-universal
+            os: macos-latest
+            arch: universal
+            ext: tar.xz
+    runs-on: ${{ matrix.os }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
+      - name: Checkout fork
+        uses: actions/checkout@v4
 
-      - name: Get 7-Zip Version
-        id: version
-        shell: bash
+      - name: Install Linux cross-compiler
+        if: ${{ matrix.target == 'linux-arm64' }}
         run: |
-          VERSION=$(sed -n 's/.*#define MY_VERSION_NUMBERS[[:space:]]*"\([^"]*\)".*/\1/p' C/7zVersion.h | head -1)
-          VERSION=${VERSION//./}
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
-      - name: Normalize line endings
-        run: find . -name "*.mak" -exec sed -i '' 's/\r$//' {} \;
-
-      - name: Build
+      - name: Compile Linux (x64)
+        if: ${{ matrix.target == 'linux-x64' }}
+        working-directory: CPP/7zip/Bundles/Alone2
         run: |
-          cd ${{ env.BUNDLE_PATH }}
-          make_args=(-j$(sysctl -n hw.ncpu) -f ../../${{ matrix.makefile }})
-          make "${make_args[@]}" > build.log 2>&1 || { tail -100 build.log; exit 1; }
+          make -j"$(nproc)" -f makefile.gcc
+          ./_o/7zz i
 
-      - name: Upload build log (on failure)
-        if: failure()
-        uses: actions/upload-artifact@v6
+      - name: Compile Linux (arm64)
+        if: ${{ matrix.target == 'linux-arm64' }}
+        working-directory: CPP/7zip/Bundles/Alone2
+        run: |
+          make -j"$(nproc)" -f makefile.gcc \
+            CC=aarch64-linux-gnu-gcc \
+            CXX=aarch64-linux-gnu-g++ \
+            CPU=arm64
+          file ./_o/7zz
+
+      - name: Setup MSVC (Windows)
+        if: ${{ startsWith(matrix.target, 'win-') }}
+        uses: ilammy/msvc-dev-cmd@v1
         with:
-          name: log-macos-clang-${{ matrix.target }}
-          path: ${{ env.BUNDLE_PATH }}/build.log
-          if-no-files-found: warn
-          retention-days: 7
+          arch: ${{ matrix.arch }}
 
-      - name: Locate binary
-        id: locate
+      - name: Compile Windows (${{ matrix.arch }})
+        if: ${{ startsWith(matrix.target, 'win-') }}
+        working-directory: CPP/7zip/Bundles/Alone2
         run: |
-          BIN_PATH="${{ env.BUNDLE_PATH }}/b/${{ matrix.output_dir }}/7zz"
-          if [ ! -f "$BIN_PATH" ]; then
-            echo "Error: Binary not found at $BIN_PATH"
-            tail -50 ${{ env.BUNDLE_PATH }}/build.log
-            exit 1
-          fi
-          echo "path=$(pwd)/$BIN_PATH" >> $GITHUB_OUTPUT
+          nmake
+          .\${{ matrix.arch }}\7zz.exe i
 
-      - name: Test binary
+      - name: Compile macOS (Universal arm64 + x86_64)
+        if: ${{ matrix.target == 'macos-universal' }}
+        working-directory: CPP/7zip/Bundles/Alone2
         run: |
-          chmod +x "${{ steps.locate.outputs.path }}"
-          "${{ steps.locate.outputs.path }}" b -md22 -mtic=31 -mmt2 -bt
+          make -j"$(sysctl -n hw.ncpu)" -f makefile.mac_arm64
+          cp _o/7zz 7zz-arm64
+          make -f makefile.mac_arm64 clean
 
-      - name: Package binary
-        id: package
+          make -j"$(sysctl -n hw.ncpu)" -f makefile.mac_x64
+          cp _o/7zz 7zz-x64
+          make -f makefile.mac_x64 clean
+
+          mkdir -p _o
+          lipo -create 7zz-arm64 7zz-x64 -output _o/7zz
+          lipo -info _o/7zz
+          ./_o/7zz i
+
+      - name: Package Unix archive (.tar.xz)
+        if: ${{ matrix.ext == 'tar.xz' }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          PKG_NAME="7z${VERSION}-mac-${{ matrix.target }}"
-          mkdir -p package
-          cp "${{ steps.locate.outputs.path }}" package/7zz
-          chmod +x package/7zz
-          tar -cJf "${PKG_NAME}.tar.xz" -C package 7zz
-          echo "package=${PKG_NAME}.tar.xz" >> $GITHUB_OUTPUT
+          mkdir -p staging artifacts
+          cp CPP/7zip/Bundles/Alone2/_o/7zz staging/
+          cp DOC/License.txt DOC/readme.txt staging/
+          SHORT_SHA="${GITHUB_SHA::7}"
+          tar -cJf "artifacts/7zip-${{ matrix.target }}-${SHORT_SHA}.tar.xz" -C staging .
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v6
+      - name: Package Windows archive (.zip)
+        if: ${{ matrix.ext == 'zip' }}
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path staging, artifacts | Out-Null
+          Copy-Item "CPP/7zip/Bundles/Alone2/${{ matrix.arch }}/7zz.exe" staging/
+          Copy-Item "DOC/License.txt", "DOC/readme.txt" staging/
+          $shortSha = $env:GITHUB_SHA.Substring(0, 7)
+          Compress-Archive -Path staging/* -DestinationPath "artifacts/7zip-${{ matrix.target }}-$shortSha.zip"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: 7z${{ steps.version.outputs.version }}-mac-${{ matrix.target }}
-          path: ${{ steps.package.outputs.package }}
-          if-no-files-found: error
-          retention-days: 7
-          compression-level: 9
+          name: 7zip-${{ matrix.target }}
+          overwrite: true
+          path: artifacts/*
+
+  publish_release:
+    name: Publish Release
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event.inputs.doRelease == 'true') && needs.build_7zip.result == 'success' }}
+    needs: build_7zip
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: 7zip-*
+          merge-multiple: true
+          path: artifacts
+
+      - name: Generate SHA256 checksums
+        working-directory: artifacts
+        run: |
+          shopt -s nullglob
+          sha256sum *.{zip,tar.xz} > checksums.sha256
+          cat checksums.sha256
+
+      - name: Create dated GitHub Release
+        id: create_release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          RELDATE="$(date -u +'%Y-%m-%d %H:%M UTC')"
+          TAGNAME="autobuild-$(date -u +'%Y-%m-%d-%H-%M')"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          gh release create "$TAGNAME" \
+            --target "${{ github.ref_name }}" \
+            --title "Auto-Build $RELDATE ($SHORT_SHA)" \
+            --notes "Automated 7-Zip build from commit \`$GITHUB_SHA\`." \
+            artifacts/*.{zip,tar.xz} artifacts/checksums.sha256
+
+      - name: Update rolling 'latest' release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          SHORT_SHA="${GITHUB_SHA::7}"
+          gh release delete --cleanup-tag --yes "latest" || true
+          sleep 5
+          gh release create "latest" \
+            --target "${{ github.ref_name }}" \
+            --title "Latest Auto-Build ($SHORT_SHA)" \
+            --notes "Rolling latest build from commit \`$GITHUB_SHA\`." \
+            artifacts/*.{zip,tar.xz} artifacts/checksums.sha256
