@@ -5,7 +5,6 @@ on:
     paths-ignore:
       - '**.md'
       - 'LICENSE'
-      - 'DOC/**'
   workflow_dispatch:
     inputs:
       doRelease:
@@ -19,7 +18,6 @@ on:
         default: false
         required: false
   schedule:
-    # Randomize minute/hour in your fork to avoid concurrent spikes
     - cron: '17 12 * * *'
 
 permissions:
@@ -43,106 +41,122 @@ jobs:
     name: Build (${{ matrix.target }})
     if: ${{ (github.event.inputs.buildOnly == 'true' && !cancelled()) || success() }}
     needs: pre_check
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: linux-x64
-            os: ubuntu-latest
-            arch: x64
             ext: tar.xz
           - target: linux-arm64
-            os: ubuntu-latest
-            arch: arm64
             ext: tar.xz
           - target: win-x64
-            os: windows-latest
-            arch: x64
             ext: zip
-          - target: win-arm64
-            os: windows-latest
-            arch: arm64
-            ext: zip
-          - target: macos-universal
-            os: macos-latest
-            arch: universal
-            ext: tar.xz
-    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout fork
         uses: actions/checkout@v4
 
-      - name: Install Linux cross-compiler
-        if: ${{ matrix.target == 'linux-arm64' }}
+      - name: Install cross-compilers and packaging tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          sudo apt-get install -y \
+            build-essential \
+            zip \
+            xz-utils \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            g++-mingw-w64-x86-64
 
       - name: Compile Linux (x64)
         if: ${{ matrix.target == 'linux-x64' }}
-        working-directory: CPP/7zip/Bundles/Alone2
         run: |
-          make -j"$(nproc)" -f makefile.gcc
-          ./_o/7zz i
+          mkdir -p staging
+          TARGETS=(
+            "CPP/7zip/Bundles/Alone2:7zz"
+            "CPP/7zip/Bundles/Alone:7za"
+            "CPP/7zip/Bundles/Alone7z:7zr"
+            "CPP/7zip/UI/Console:7z"
+            "CPP/7zip/Bundles/Format7zF:7z.so"
+            "CPP/7zip/Bundles/SFXCon:7zCon.sfx"
+          )
+          for item in "${TARGETS[@]}"; do
+            dir="${item%%:*}"
+            bin="${item##*:}"
+            make -C "$dir" -j"$(nproc)" -f makefile.gcc
+            cp "$dir/_o/$bin" staging/
+          done
+          ./staging/7zz i
 
       - name: Compile Linux (arm64)
         if: ${{ matrix.target == 'linux-arm64' }}
-        working-directory: CPP/7zip/Bundles/Alone2
         run: |
-          make -j"$(nproc)" -f makefile.gcc \
-            CC=aarch64-linux-gnu-gcc \
-            CXX=aarch64-linux-gnu-g++ \
-            CPU=arm64
-          file ./_o/7zz
+          mkdir -p staging
+          TARGETS=(
+            "CPP/7zip/Bundles/Alone2:7zz"
+            "CPP/7zip/Bundles/Alone:7za"
+            "CPP/7zip/Bundles/Alone7z:7zr"
+            "CPP/7zip/UI/Console:7z"
+            "CPP/7zip/Bundles/Format7zF:7z.so"
+            "CPP/7zip/Bundles/SFXCon:7zCon.sfx"
+          )
+          for item in "${TARGETS[@]}"; do
+            dir="${item%%:*}"
+            bin="${item##*:}"
+            make -C "$dir" -j"$(nproc)" -f makefile.gcc \
+              CC=aarch64-linux-gnu-gcc \
+              CXX=aarch64-linux-gnu-g++ \
+              CPU=arm64
+            cp "$dir/_o/$bin" staging/
+          done
+          file ./staging/7zz
 
-      - name: Setup MSVC (Windows)
-        if: ${{ startsWith(matrix.target, 'win-') }}
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: ${{ matrix.arch }}
-
-      - name: Compile Windows (${{ matrix.arch }})
-        if: ${{ startsWith(matrix.target, 'win-') }}
-        working-directory: CPP/7zip/Bundles/Alone2
+      - name: Cross-compile full Windows suite (win-x64)
+        if: ${{ matrix.target == 'win-x64' }}
         run: |
-          nmake
-          .\${{ matrix.arch }}\7zz.exe i
+          mkdir -p staging
+          TARGETS=(
+            "CPP/7zip/Bundles/Format7zF:7z.dll:7z.dll"
+            "CPP/7zip/UI/Console:7z.exe:7z.exe"
+            "CPP/7zip/UI/FileManager:7zFM.exe:7zFM.exe"
+            "CPP/7zip/UI/GUI:7zG.exe:7zG.exe"
+            "CPP/7zip/UI/Explorer:7-zip.dll:7-zip.dll"
+            "CPP/7zip/Bundles/SFXWin:7z.sfx:7z.sfx"
+            "CPP/7zip/Bundles/SFXCon:7zCon.sfx:7zCon.sfx"
+            "CPP/7zip/Bundles/Alone2:7zz.exe:7zz.exe"
+            "C/Util/7zipUninstall:7zipUninstall.exe:Uninstall.exe"
+          )
+          for item in "${TARGETS[@]}"; do
+            IFS=':' read -r dir out dest <<< "$item"
+            echo "=== Building $dest from $dir ==="
+            make -C "$dir" -j"$(nproc)" -f makefile.gcc \
+              IS_MINGW=1 \
+              CROSS_COMPILE=x86_64-w64-mingw32- \
+              CC="x86_64-w64-mingw32-gcc-win32" \
+              CXX="x86_64-w64-mingw32-g++-win32 -static-libgcc -static-libstdc++" \
+              WINDRES="x86_64-w64-mingw32-windres"
+            cp "$dir/_o/$out" "staging/$dest"
+          done
 
-      - name: Compile macOS (Universal arm64 + x86_64)
-        if: ${{ matrix.target == 'macos-universal' }}
-        working-directory: CPP/7zip/Bundles/Alone2
+          if [ -d "Lang" ]; then
+            cp -r Lang staging/Lang
+          fi
+
+          # Verify PE format and confirm zero MinGW runtime DLL dependencies
+          file staging/7z.exe staging/7zFM.exe staging/7z.dll
+          x86_64-w64-mingw32-objdump -p staging/7zFM.exe | grep "DLL Name:"
+
+      - name: Package archive
         run: |
-          make -j"$(sysctl -n hw.ncpu)" -f makefile.mac_arm64
-          cp _o/7zz 7zz-arm64
-          make -f makefile.mac_arm64 clean
-
-          make -j"$(sysctl -n hw.ncpu)" -f makefile.mac_x64
-          cp _o/7zz 7zz-x64
-          make -f makefile.mac_x64 clean
-
-          mkdir -p _o
-          lipo -create 7zz-arm64 7zz-x64 -output _o/7zz
-          lipo -info _o/7zz
-          ./_o/7zz i
-
-      - name: Package Unix archive (.tar.xz)
-        if: ${{ matrix.ext == 'tar.xz' }}
-        run: |
-          mkdir -p staging artifacts
-          cp CPP/7zip/Bundles/Alone2/_o/7zz staging/
-          cp DOC/License.txt DOC/readme.txt staging/
+          mkdir -p artifacts
+          for doc in DOC/History.txt DOC/License.txt DOC/readme.txt DOC/descript.ion; do
+            [ -f "$doc" ] && cp "$doc" staging/
+          done
           SHORT_SHA="${GITHUB_SHA::7}"
-          tar -cJf "artifacts/7zip-${{ matrix.target }}-${SHORT_SHA}.tar.xz" -C staging .
-
-      - name: Package Windows archive (.zip)
-        if: ${{ matrix.ext == 'zip' }}
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path staging, artifacts | Out-Null
-          Copy-Item "CPP/7zip/Bundles/Alone2/${{ matrix.arch }}/7zz.exe" staging/
-          Copy-Item "DOC/License.txt", "DOC/readme.txt" staging/
-          $shortSha = $env:GITHUB_SHA.Substring(0, 7)
-          Compress-Archive -Path staging/* -DestinationPath "artifacts/7zip-${{ matrix.target }}-$shortSha.zip"
+          if [[ "${{ matrix.ext }}" == "zip" ]]; then
+            (cd staging && zip -r "../artifacts/7zip-${{ matrix.target }}-${SHORT_SHA}.zip" .)
+          else
+            tar -cJf "artifacts/7zip-${{ matrix.target }}-${SHORT_SHA}.tar.xz" -C staging .
+          fi
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -172,7 +186,6 @@ jobs:
           cat checksums.sha256
 
       - name: Create dated GitHub Release
-        id: create_release
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
